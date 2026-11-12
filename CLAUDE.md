@@ -255,6 +255,7 @@ side by side: what each source does, what it costs, its free tier, and which
 | Source | Cost | Free tier | Best for |
 |---|---|---|---|
 | **OpenStreetMap** (default) | free | unlimited | Trying the whole pipeline with no account. Thin coverage for service-area trades — OSM maps premises, so it has under 2,000 roofers in the entire US. A trial source, not a complete list. |
+| **Your own list (CSV)** | free | unlimited | A list the user already has (CRM export, bought list, own scraper): `OWN_LIST_CSV=path` in `.env`, then `sellbird discover --provider csv`. Rows are matched to each search by category and city/region. |
 | **DataForSEO Business Listings** | $0.372/1k businesses | $1 credit | Local trades, clinics, contractors. Phone + domain + rating + whether the listing is claimed, and it can filter for businesses with **no website at all**. |
 | **DataForSEO SERP** | $0.006 a search at depth 30 (Live, $0.002 per 10 results) | $1 credit + free sandbox | Rank as the buying signal. Positions 11-30 are the sweet spot. Also records who holds the local 3-pack (`IN_LOCAL_PACK`). |
 | **DataForSEO Google Maps** | $0.002 a search (up to 100 results) | $1 credit + free sandbox | Map rank (`MAPS_RANK`), rating, category, claimed status; keeps businesses with no website. |

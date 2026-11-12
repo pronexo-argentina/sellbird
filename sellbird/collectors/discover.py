@@ -26,7 +26,9 @@ import base64
 import logging
 import math
 import re
+import unicodedata
 from html import unescape
+from pathlib import Path
 from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from urllib.parse import urlparse
@@ -1455,9 +1457,169 @@ class ScavioSearch(ScavioProvider):
         return out
 
 
+
+# ── Your own list ──────────────────────────────────────────────────────
+
+def _fold(text: str) -> str:
+    """Lower-case ASCII words, accents dropped: "Ferretería" and "ferreterias"
+    become comparable, and so do "Córdoba" and "Cordoba"."""
+    text = unicodedata.normalize("NFKD", text or "")
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+def _word_match(a: str, b: str) -> bool:
+    """One word is the other, or its stem: ferreteria/ferreterias,
+    corralon/corralones, hotel/hoteles. Short words never match by prefix,
+    so "bar" is not "barberias"."""
+    if len(a) < 4 or len(b) < 4:
+        return a == b
+    return a.startswith(b) or b.startswith(a)
+
+
+class OwnList(DiscoveryProvider):
+    """A list you already have, as a CSV file. Free, offline, nothing is called.
+
+    An export from your CRM, a list you bought, a scraper of your own: whatever
+    it is, each query keeps the rows whose category matches the search term
+    and whose city or region matches the place, and they go through the same
+    junk filter, do-not-contact check and profiling as any paid source.
+
+    Columns (header names, case and accents ignored): ``name`` and ``website``
+    (or ``domain``), plus optional ``phone``, ``address``, ``city``, ``region``,
+    ``country``, ``category`` and ``id``. Spanish headers are recognised too
+    (``nombre``, ``web``, ``telefono``, ``direccion``, ``localidad``,
+    ``provincia``, ``pais``, ``rubro``). A row with neither website nor id
+    cannot be told apart from its namesakes and is skipped.
+    """
+
+    key = "csv"
+    label = "Your own list (CSV)"
+    kind = "listings"
+    blurb = ("A CSV you already have: a CRM export, a bought list, your own "
+             "scraper. Free and offline; nothing is called.")
+    cost_note = "free"
+    free_tier = "unlimited"
+    signup_url = "https://github.com/ethanplusai/sellbird/blob/main/docs/signals-and-pipeline.md#1-discover--who-exists"
+    env_keys = ("own_list_csv",)
+    caveat = ("Only as complete as the file. Each search keeps the rows whose "
+              "category matches the term and whose city or region matches the "
+              "place, so name the terms the way the file's category column does.")
+
+    COLUMNS = {
+        "name": ("name", "nombre", "company", "empresa", "business"),
+        "website": ("website", "web", "url", "domain", "dominio", "site", "sitio"),
+        "phone": ("phone", "telefono", "tel", "whatsapp"),
+        "address": ("address", "direccion"),
+        "city": ("city", "localidad", "ciudad", "town"),
+        "region": ("region", "state", "provincia", "province"),
+        "country": ("country", "pais"),
+        "category": ("category", "rubro", "industry", "categoria", "type"),
+        "id": ("id", "external_id"),
+    }
+
+    def __init__(self):
+        self._cache: tuple[str, float, list[dict]] | None = None
+
+    def _path(self, env: dict) -> Path:
+        raw = (env.get("own_list_csv") or "").strip()
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            from sellbird.paths import PROJECT_ROOT
+            p = PROJECT_ROOT / p
+        return p
+
+    def _rows(self, env: dict) -> list[dict]:
+        import csv
+        p = self._path(env)
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            raise ProviderExhausted(f"OWN_LIST_CSV: {p} is not a readable file")
+        if self._cache and self._cache[0] == str(p) and self._cache[1] == mtime:
+            return self._cache[2]
+        with p.open(encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            headers = {_fold(h): h for h in (reader.fieldnames or [])}
+            picked = {}
+            for field_name, aliases in self.COLUMNS.items():
+                for alias in aliases:
+                    if alias in headers:
+                        picked[field_name] = headers[alias]
+                        break
+            if "name" not in picked:
+                raise ProviderExhausted(f"OWN_LIST_CSV: {p} has no name column")
+            rows = []
+            for raw in reader:
+                row = {k: (raw.get(h) or "").strip() for k, h in picked.items()}
+                row["_category"] = _fold(row.get("category", ""))
+                row["_city"] = _fold(row.get("city", ""))
+                row["_region"] = _fold(row.get("region", ""))
+                row["_country"] = _fold(row.get("country", ""))
+                rows.append(row)
+        self._cache = (str(p), mtime, rows)
+        return rows
+
+    @staticmethod
+    def term_matches(term: str, category: str) -> bool:
+        """The folded term is the category, or shares a stem with one of its
+        words. A file with no category column matches every term."""
+        t, c = _fold(term), category
+        if not c:
+            return True
+        if not t or t == c:
+            return bool(t)
+        return any(_word_match(a, b) for a in t.split() for b in c.split())
+
+    @staticmethod
+    def place_matches(location: str, city: str, region: str, country: str) -> bool:
+        """"Rosario, Santa Fe, Argentina": the first part names the city (or
+        the region, for a whole province), and every further part has to
+        appear somewhere in the row's city, region or country, so "Rosario
+        del Tala" in another province stays out."""
+        parts = [_fold(p) for p in location.split(",") if _fold(p)]
+        if not parts:
+            return True
+        head = parts[0]
+
+        def names(value: str) -> bool:
+            return value == head or value.startswith(head + " ")
+
+        if not (names(city) or names(region)):
+            return False
+        known = " | ".join(v for v in (city, region, country) if v)
+        return all(part in known for part in parts[1:]) if (region or country) else True
+
+    async def fetch(self, client, env, query: DiscoveryQuery) -> list[Business]:
+        out = []
+        for row in self._rows(env):
+            if not self.term_matches(query.term, row["_category"]):
+                continue
+            if not self.place_matches(query.location, row["_city"], row["_region"], row["_country"]):
+                continue
+            website = row.get("website", "")
+            domain = normalize_domain(website)
+            external = f"csv:{row['id']}" if row.get("id") else ""
+            if not domain and not external:
+                continue
+            out.append(Business(
+                name=row["name"], domain=domain,
+                website=website if domain else "",
+                phone=row.get("phone", ""), address=row.get("address", ""),
+                location=", ".join(v for v in (row.get("city"), row.get("region")) if v) or query.location,
+                category=row.get("category", "") or query.term,
+                has_website=bool(domain), external_id=external,
+                provider=self.key, raw_title=row["name"],
+            ))
+            if len(out) >= query.limit:
+                break
+        return out
+
+
 PROVIDERS: dict[str, DiscoveryProvider] = {
     p.key: p for p in (
         OpenStreetMap(),
+        OwnList(),
         TinyFish(),
         DataForSEOListings(),
         DataForSEOSerp(),

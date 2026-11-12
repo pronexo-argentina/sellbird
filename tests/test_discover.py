@@ -1743,3 +1743,70 @@ async def test_osm_maps_spanish_business_terms():
     assert provider._tags("comercio al mayor") == ["shop=wholesale"]
     assert provider._tags("mayorista") == ["shop=wholesale"]
     assert provider._tags("mayor's office") == []
+
+
+# ── Your own list (CSV) ───────────────────────────────────────────────
+
+OWN_LIST = """id,nombre,web,telefono,localidad,provincia,pais,rubro
+1,Ferretera Centro,https://www.ferreteracentro.example/,+54 341 555-0100,Rosario,Santa Fe,Argentina,ferreterias
+2,Bulonera del Tala,https://bulonera.example,,Rosario del Tala,Entre Rios,Argentina,ferreterias
+3,Estudio Contable Sur,https://contablesur.example,,Rosario - Santa Fe,Santa Fe,Argentina,contadores
+4,Hotel Plaza,https://hotelplaza.example,,Cordoba,Cordoba,Argentina,hoteles
+5,Bar Sin Web,,,Rosario,Santa Fe,Argentina,barberias
+"""
+
+
+def _own_list(tmp_path, monkeypatch, text=OWN_LIST):
+    path = tmp_path / "lista.csv"
+    path.write_text(text, encoding="utf-8")
+    monkeypatch.setattr("sellbird.paths.PROJECT_ROOT", tmp_path)
+    return {"own_list_csv": "lista.csv"}
+
+
+@pytest.mark.asyncio
+async def test_own_list_keeps_rows_matching_term_and_place(tmp_path, monkeypatch):
+    env = _own_list(tmp_path, monkeypatch)
+    provider = D.OwnList()
+    out = await provider.fetch(None, env, D.DiscoveryQuery(
+        term="ferretería", location="Rosario, Santa Fe, Argentina"))
+    # Accents and plurals are folded, and the other province's Rosario stays out.
+    assert [b.domain for b in out] == ["ferreteracentro.example"]
+    assert out[0].phone == "+54 341 555-0100" and out[0].has_website is True
+    assert out[0].category == "ferreterias" and out[0].external_id == "csv:1"
+
+    out = await provider.fetch(None, env, D.DiscoveryQuery(
+        term="contadores", location="Rosario, Santa Fe, Argentina"))
+    assert [b.domain for b in out] == ["contablesur.example"]   # "Rosario - Santa Fe"
+
+    # The first part may name a whole province.
+    out = await provider.fetch(None, env, D.DiscoveryQuery(term="hotel", location="Córdoba, Argentina"))
+    assert [b.domain for b in out] == ["hotelplaza.example"]
+
+    # A short word never matches by prefix: "bar" is not "barberias".
+    assert await provider.fetch(None, env, D.DiscoveryQuery(term="bar", location="Rosario")) == []
+    # A term the file does not carry returns nothing rather than everything.
+    assert await provider.fetch(None, env, D.DiscoveryQuery(
+        term="Retail and multi-store commerce", location="Rosario")) == []
+
+
+@pytest.mark.asyncio
+async def test_own_list_without_website_or_id_is_skipped_and_limit_holds(tmp_path, monkeypatch):
+    env = _own_list(tmp_path, monkeypatch, "name,city,category\nA,Rosario,x\nB,Rosario,x\nC,Rosario,x\n")
+    provider = D.OwnList()
+    assert await provider.fetch(None, env, D.DiscoveryQuery(term="x", location="Rosario")) == []
+    env = _own_list(tmp_path, monkeypatch, "id,name,city,category\n1,A,Rosario,x\n2,B,Rosario,x\n3,C,Rosario,x\n")
+    out = await D.OwnList().fetch(None, env, D.DiscoveryQuery(term="x", location="Rosario", limit=2))
+    assert [b.external_id for b in out] == ["csv:1", "csv:2"] and out[0].has_website is False
+
+
+@pytest.mark.asyncio
+async def test_own_list_missing_file_stops_the_run(tmp_path, monkeypatch):
+    monkeypatch.setattr("sellbird.paths.PROJECT_ROOT", tmp_path)
+    with pytest.raises(D.ProviderExhausted, match="OWN_LIST_CSV"):
+        await D.OwnList().fetch(None, {"own_list_csv": "nope.csv"}, D.DiscoveryQuery(term="x"))
+
+
+def test_own_list_is_free_and_needs_only_the_file():
+    p = D.PROVIDERS["csv"]
+    assert p.cost_note == "free" and p.estimate([D.DiscoveryQuery(term="x")] * 500) == 0.0
+    assert p.missing_keys({}) == ["own_list_csv"]
